@@ -21,7 +21,7 @@ class GPAGateway:
             choice: Choice,
             stage: Stage,
             request: Request,
-            additional_instructions: Optional[str]
+            task_description: str
     ) -> Message:
         api_key = request.api_key
         client: AsyncDial = AsyncDial(
@@ -31,7 +31,7 @@ class GPAGateway:
 
         chunks = await client.chat.completions.create(
             stream=True,
-            messages=self.__prepare_gpa_messages(request, additional_instructions),
+            messages=self.__prepare_gpa_messages(request, task_description),
             deployment_name="general-purpose-agent",
             extra_headers={
                 'x-conversation-id': request.headers.get('x-conversation-id'),
@@ -90,7 +90,7 @@ class GPAGateway:
             content=StrictStr(content),
         )
 
-    def __prepare_gpa_messages(self, request: Request, additional_instructions: Optional[str]) -> list[dict[str, Any]]:
+    def __prepare_gpa_messages(self, request: Request, task_description: Optional[str]) -> list[dict[str, Any]]:
         res_messages = []
 
         for idx in range(len(request.messages)):
@@ -100,22 +100,20 @@ class GPAGateway:
                     msg_state = msg.custom_content.state
                     if msg_state.get(_IS_GPA):
                         # 1. add user request (user message is always before assistant message)
-                        res_messages.append(request.messages[idx-1].dict(exclude_none=True))
+                        res_messages.append(request.messages[idx - 1].dict(exclude_none=True))
                         # 2. Copy assistant message
                         copied_msg = deepcopy(msg)
                         copied_msg.custom_content.state = msg_state.get(_GPA_MESSAGES)
                         res_messages.append(copied_msg.dict(exclude_none=True))
 
         last_user_msg = request.messages[-1]
-        if additional_instructions:
-            res_messages.append(
-                {
-                    "role": Role.USER,
-                    "content": f"{last_user_msg.content}\n\n{additional_instructions}",
-                    "custom_content": last_user_msg.custom_content.dict(exclude_none=True),
-                }
-            )
-        else:
-            res_messages.append(last_user_msg.dict(exclude_none=True))
+        usr_msg: dict[str, Any] = {
+            "role": Role.USER,
+            "content": task_description,
+        }
+        if last_user_msg.custom_content:
+            usr_msg["custom_content"] = last_user_msg.custom_content.dict(exclude_none=True)
+
+        res_messages.append(usr_msg)
 
         return res_messages

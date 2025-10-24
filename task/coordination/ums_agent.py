@@ -19,7 +19,7 @@ class UMSAgentGateway:
             choice: Choice,
             stage: Stage,
             request: Request,
-            additional_instructions: Optional[str]
+            task_description: Optional[str]
     ) -> Message:
         ums_conversation_id = self.__get_ums_conversation_id(request)
 
@@ -27,13 +27,9 @@ class UMSAgentGateway:
             ums_conversation_id = await self.__create_ums_conversation()
             stage.append_content(f"_Created new UMS conversation: {ums_conversation_id}_\n\n")
 
-        user_message = request.messages[-1].content
-        if additional_instructions:
-            user_message = f"{user_message}\n\n{additional_instructions}"
-
         content = await self.__call_ums_agent(
             conversation_id=ums_conversation_id,
-            user_message=user_message,
+            user_message=task_description,
             stage=stage
         )
 
@@ -42,6 +38,7 @@ class UMSAgentGateway:
         return Message(
             role=Role.ASSISTANT,
             content=StrictStr(content),
+
         )
 
     def __get_ums_conversation_id(self, request: Request) -> Optional[str]:
