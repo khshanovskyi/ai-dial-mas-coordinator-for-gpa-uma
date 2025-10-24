@@ -1,0 +1,4 @@
+aidial-sdk==0.22.1
+aidial-client>=0.3.0
+pydantic>=2.11.10
+httpx>=0.28.1

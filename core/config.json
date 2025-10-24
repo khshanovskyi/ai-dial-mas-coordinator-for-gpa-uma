@@ -1,0 +1,70 @@
+{
+  "routes": {},
+  "applications": {
+    "general-purpose-agent": {
+      "displayName": "General Purpose Agent",
+      "description": "General Purpose Agent. Equipped with: WEB search (DuckDuckGo via MCP), RAG search (supports PDF, TXT, CSV files), Python Code Interpreter (via MCP), Image Generation (model).",
+      "endpoint": "http://host.docker.internal:8052/openai/deployments/general-purpose-agent/chat/completions",
+      "inputAttachmentTypes": [
+        "image/png",
+        "image/jpeg",
+        "application/pdf",
+        "text/html",
+        "text/plain",
+        "text/csv"
+      ],
+      "forwardAuthToken": true
+    },
+    "mas-coordinator": {
+      "displayName": "MAS Coordinator Agent",
+      "description": "MAS Coordinator Agent that coordinates user requests to General-purpose Agent or UMS Agent",
+      "endpoint": "http://host.docker.internal:8055/openai/deployments/mas-coordinator/chat/completions",
+      "inputAttachmentTypes": [
+        "image/png",
+        "image/jpeg",
+        "application/pdf",
+        "text/html",
+        "text/plain",
+        "text/csv"
+      ],
+      "forwardAuthToken": true
+    }
+  },
+  "models": {
+    "gpt-4o": {
+      "displayName": "GPT 4o",
+      "endpoint": "http://adapter-dial:5000/openai/deployments/gpt-4o/chat/completions",
+      "iconUrl": "http://localhost:3001/gpt4.svg",
+      "type": "chat",
+      "upstreams": [
+        {
+          "endpoint": "https://ai-proxy.lab.epam.com/openai/deployments/gpt-4o/chat/completions",
+          "key": "{YOUR_DIAL_API_KEY}"
+        }
+      ]
+    },
+    "dall-e-3": {
+      "displayName": "DALL-E",
+      "endpoint": "http://adapter-dial:5000/openai/deployments/dall-e-3/chat/completions",
+      "iconUrl": "http://localhost:3001/gpt3.svg",
+      "type": "chat",
+      "upstreams": [
+        {
+          "endpoint": "https://ai-proxy.lab.epam.com/openai/deployments/dall-e-3/chat/completions",
+          "key": "{YOUR_DIAL_API_KEY}"
+        }
+      ]
+    }
+  },
+  "keys": {
+    "dial_api_key": {
+      "project": "TEST-PROJECT",
+      "role": "default"
+    }
+  },
+  "roles": {
+    "default": {
+      "limits": {}
+    }
+  }
+}

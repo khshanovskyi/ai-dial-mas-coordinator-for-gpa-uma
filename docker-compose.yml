@@ -1,0 +1,148 @@
+services:
+  themes:
+    image: epam/ai-dial-chat-themes:development
+    ports:
+      - "3001:8080"
+
+  chat:
+    ports:
+      - "3000:3000"
+    image: epam/ai-dial-chat:development
+#    platform: linux/amd64
+    depends_on:
+      - themes
+      - core
+    environment:
+      NEXTAUTH_SECRET: "secret"
+      THEMES_CONFIG_HOST: "http://themes:8080"
+      DIAL_API_HOST: "http://core:8080"
+      DIAL_API_KEY: "dial_api_key"
+      ENABLED_FEATURES: "conversations-section,prompts-section,top-settings,top-clear-conversation,top-chat-info,top-chat-model-settings,empty-chat-settings,header,footer,request-api-key,report-an-issue,likes,conversations-sharing,prompts-sharing,input-files,attachments-manager,conversations-publishing,prompts-publishing,custom-logo,input-links,custom-applications,message-templates,marketplace,quick-apps,code-apps,mindmap-apps"
+      KEEP_ALIVE_TIMEOUT: ${CHAT_KEEP_ALIVE_TIMEOUT:-20000}
+
+  redis:
+    image: redis:7.2.4-alpine3.19
+    restart: always
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --maxmemory 2000mb
+      --maxmemory-policy volatile-lfu
+      --save ""
+      --appendonly no
+      --loglevel warning
+    mem_limit: 2200M
+
+  redis-insight:
+    image: redislabs/redisinsight:latest
+    ports:
+      - "6380:5540"
+
+  core:
+    user: ${UID:-root}
+    ports:
+      - "8080:8080"
+    image: epam/ai-dial-core:development
+    environment:
+      'AIDIAL_SETTINGS': '/opt/settings/settings.json'
+      'JAVA_OPTS': '-Dgflog.config=/opt/settings/gflog.xml'
+      'LOG_DIR': '/app/log'
+      'STORAGE_DIR': '/app/data'
+      'aidial.config.files': '["/opt/config/config.json"]'
+      'aidial.storage.overrides': '{ "jclouds.filesystem.basedir": "data" }'
+      'aidial.redis.singleServerConfig.address': 'redis://redis:6379'
+      'LOG_LEVEL': "DEBUG"
+    depends_on:
+      - redis
+    volumes:
+      - ./settings:/opt/settings
+      - ${DIAL_DIR:-.}/core:/opt/config
+      - ${DIAL_DIR:-.}/core-logs/:/app/log
+      - ${DIAL_DIR:-.}/core-data/:/app/data
+
+  adapter-dial:
+    image: epam/ai-dial-adapter-dial:development
+    environment:
+      DIAL_URL: "http://core:8080"
+      LOG_LEVEL: "INFO"
+
+# UMS
+  userservice:
+    image: khshanovskyi/mockuserservice:latest
+    ports:
+      - "8040:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GENERATE_USERS=true
+      - USER_COUNT=1000
+    volumes:
+      - ./data:/app/data
+
+  ums-mcp-server:
+    depends_on:
+      - redis
+      - userservice
+    image: khshanovskyi/ums-mcp-server:latest
+    ports:
+      - "8041:8005"
+    environment:
+      - USERS_MANAGEMENT_SERVICE_URL=${USERS_MANAGEMENT_SERVICE_URL:-http://userservice:8000}
+    volumes:
+      - ./data:/app/data
+
+  ums-agent:
+    depends_on:
+      - redis
+      - ums-mcp-server
+    image: khshanovskyi/dial-ums-agent:latest
+    ports:
+      - "8042:8000"
+    environment:
+      - UMS_MCP_URL=http://ums-mcp-server:8005/mcp
+      - DIAL_API_KEY=${DIAL_API_KEY}
+      - ORCHESTRATION_MODEL=gpt-4o
+      - DIAL_URL=https://ai-proxy.lab.epam.com
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+# General-purpose Agent
+  python-interpreter-mcp-server:
+    image: khshanovskyi/python-code-interpreter-mcp-server:latest
+    ports:
+      - "8050:8000"
+    environment:
+      LOG_LEVEL: "INFO"
+    restart: unless-stopped
+    mem_limit: 2G
+    cpus: 2.0
+
+  ddg-search-mcp-server:
+    image: khshanovskyi/ddg-mcp-server:latest
+    ports:
+      - "8051:8000"
+    environment:
+      LOG_LEVEL: "INFO"
+      MCP_TRANSPORT: "streamable-http"
+    restart: unless-stopped
+    mem_limit: 512M
+    cpus: 0.5
+
+  general-purpose-agent:
+    depends_on:
+      - redis
+      - python-interpreter-mcp-server
+      - ddg-search-mcp-server
+    image: khshanovskyi/dial-gpa-agent:latest
+    ports:
+      - "8052:5000"
+    environment:
+      - DEPLOYMENT_NAME=gpt-4o
+      - DIAL_ENDPOINT=http://core:8080
+      - PYINTERPRETER_MCP_URL=http://python-interpreter-mcp-server:8000/mcp
+      - DDG_MCP_URL=http://ddg-search-mcp-server:8000/mcp
+    volumes:
+      - ./data:/app/data
