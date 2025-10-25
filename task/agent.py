@@ -39,6 +39,7 @@ class MASCoordinator:
         #    `response_format` https://platform.openai.com/docs/guides/structured-outputs?example=structured-data and
         #    response will be returned in JSON format. The `response_format` parameter must be provided as extra_body dict
         #    {response_format": {"type": "json_schema","json_schema": {"name": "response","schema": CoordinationRequest.model_json_schema()}}}
+        #    provide api_version="2024-08-01-preview" (required)
         # 2. Get content from response -> choice -> message -> content
         # 3. Load as dict
         # 4. Create CoordinationRequest from result, since CoordinationRequest is pydentic model, you can use `model_validate` method
