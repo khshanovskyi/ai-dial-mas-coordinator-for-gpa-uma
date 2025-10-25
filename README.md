@@ -2,6 +2,9 @@
 
 **This is the simplest version of MAS Coordinator that works as a *router* between GPA and UMS Agents**
 
+<img src="mas-simple-coordinator-flow.png">
+
+---
 
 ### Task 1: Preparation of docker compose with all the services:
 <details>
