@@ -36,6 +36,8 @@ services:
 
   redis-insight:
     image: redislabs/redisinsight:latest
+    depends_on:
+      - redis
     ports:
       - "6380:5540"
 

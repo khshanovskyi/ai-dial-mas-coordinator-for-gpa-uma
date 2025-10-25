@@ -19,49 +19,18 @@ logger = get_logger(__name__)
 class MASCoordinatorApplication(ChatCompletion):
 
     async def chat_completion(self, request: Request, response: Response) -> None:
-        conversation_id = request.headers.get('x-conversation-id', 'unknown')
-        logger.info(f"Received chat completion request [conversation_id={conversation_id}]")
-        logger.debug(f"Request details: {len(request.messages)} messages")
-
-        try:
-            with response.create_single_choice() as choice:
-                logger.debug(f"Created response choice [conversation_id={conversation_id}]")
-
-                await MASCoordinator(
-                    endpoint=DIAL_ENDPOINT,
-                    deployment_name=DEPLOYMENT_NAME,
-                    ums_agent_endpoint=UMS_AGENT_ENDPOINT
-                ).handle_request(
-                    choice=choice,
-                    request=request,
-                )
-
-                logger.info(f"Successfully completed chat request [conversation_id={conversation_id}]")
-
-        except Exception as e:
-            logger.error(
-                f"Error processing chat completion [conversation_id={conversation_id}]: {str(e)}",
-                exc_info=True
-            )
-            raise
+        #TODO:
+        # 1. Create single choice with context manager
+        # 2. Create MASCoordinator and handle request
+        raise NotImplementedError()
 
 
-logger.info("Creating DIAL application")
-app: DIALApp = DIALApp()
-agent_app = MASCoordinatorApplication()
-app.add_chat_completion(deployment_name="mas-coordinator", impl=agent_app)
-logger.info("DIAL application initialized successfully")
 
+#TODO:
+# 1. Create DIALApp
+# 2. Create MASCoordinatorApplication
+# 3. Add to created DIALApp chat_completion with:
+#       - deployment_name="mas-coordinator"
+#       - impl=agent_app
+# 4. Run it with uvicorn: `uvicorn.run({CREATED_DIAL_APP}, port=8055, host="0.0.0.0")`
 
-if __name__ == "__main__":
-    import sys
-
-    if 'pydevd' in sys.modules:
-        logger.info("Running in debug mode")
-        config = uvicorn.Config(app, port=8055, host="0.0.0.0", log_level="info")
-        server = uvicorn.Server(config)
-        import asyncio
-        asyncio.run(server.serve())
-    else:
-        logger.info("Starting uvicorn server on 0.0.0.0:8055")
-        uvicorn.run(app, port=8055, host="0.0.0.0", log_level="info")
