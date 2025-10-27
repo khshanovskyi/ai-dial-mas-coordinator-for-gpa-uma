@@ -5,10 +5,9 @@ from aidial_client import AsyncDial
 from aidial_sdk.chat_completion import Role, Choice, Request, Message, CustomContent, Stage, Attachment
 from pydantic import StrictStr
 
+from task.constants import GPA_MESSAGES
 from task.stage_util import StageProcessor
 
-_IS_GPA = "is_gpa"
-_GPA_MESSAGES = "gpa_messages"
 
 
 class GPAGateway:
@@ -21,7 +20,8 @@ class GPAGateway:
             choice: Choice,
             stage: Stage,
             request: Request,
-            task_description: str
+            task_description: str,
+            gpa_intermediate_state: list
     ) -> Message:
         api_key = request.api_key
         client: AsyncDial = AsyncDial(
@@ -31,7 +31,7 @@ class GPAGateway:
 
         chunks = await client.chat.completions.create(
             stream=True,
-            messages=self.__prepare_gpa_messages(request, task_description),
+            messages=self.__prepare_gpa_messages(request, task_description, gpa_intermediate_state),
             deployment_name="general-purpose-agent",
             extra_headers={
                 'x-conversation-id': request.headers.get('x-conversation-id'),
@@ -78,19 +78,18 @@ class GPAGateway:
                 Attachment(**attachment.dict(exclude_none=True))
             )
 
-        choice.set_state(
-            {
-                _IS_GPA: True,
-                _GPA_MESSAGES: result_custom_content.state,
-            }
-        )
-
         return Message(
             role=Role.ASSISTANT,
             content=StrictStr(content),
+            custom_content=result_custom_content,
         )
 
-    def __prepare_gpa_messages(self, request: Request, task_description: Optional[str]) -> list[dict[str, Any]]:
+    def __prepare_gpa_messages(
+            self,
+            request: Request,
+            task_description: Optional[str],
+            gpa_intermediate_state: list
+    ) -> list[dict[str, Any]]:
         res_messages = []
 
         for idx in range(len(request.messages)):
@@ -98,12 +97,12 @@ class GPAGateway:
             if msg.role == Role.ASSISTANT:
                 if msg.custom_content and msg.custom_content.state:
                     msg_state = msg.custom_content.state
-                    if msg_state.get(_IS_GPA):
+                    if msg_state.get(GPA_MESSAGES):
                         # 1. add user request (user message is always before assistant message)
                         res_messages.append(request.messages[idx - 1].dict(exclude_none=True))
                         # 2. Copy assistant message
                         copied_msg = deepcopy(msg)
-                        copied_msg.custom_content.state = msg_state.get(_GPA_MESSAGES)
+                        copied_msg.custom_content.state = msg_state.get(GPA_MESSAGES)
                         res_messages.append(copied_msg.dict(exclude_none=True))
 
         last_user_msg = request.messages[-1]
@@ -113,6 +112,14 @@ class GPAGateway:
         }
         if last_user_msg.custom_content:
             usr_msg["custom_content"] = last_user_msg.custom_content.dict(exclude_none=True)
+            if last_user_msg.custom_content.state:
+                if last_user_msg.custom_content.state.get(GPA_MESSAGES):
+                    usr_msg["custom_content"]["state"] = usr_msg["custom_content"]["state"][GPA_MESSAGES].extend(gpa_intermediate_state)
+                else:
+                    usr_msg["custom_content"]["state"][GPA_MESSAGES] = gpa_intermediate_state
+            else:
+                usr_msg["custom_content"]["state"] = {GPA_MESSAGES: gpa_intermediate_state}
+
 
         res_messages.append(usr_msg)
 

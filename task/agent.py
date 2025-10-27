@@ -1,16 +1,16 @@
-import asyncio
 import json
 from copy import deepcopy
-from typing import Any, List, Dict, Optional
+from typing import Any, Optional
 
 from aidial_client import AsyncDial
 from aidial_sdk.chat_completion import Role, Choice, Request, Message, Stage
 from pydantic import StrictStr
 
+from task.constants import UMS_CONVERSATION_ID, GPA_MESSAGES
 from task.coordination.gpa import GPAGateway
 from task.coordination.ums_agent import UMSAgentGateway
 from task.logging_config import get_logger
-from task.models import TaskDecomposition, Subtask, AgentResult, AgentName
+from task.models import TaskDecomposition, Subtask, AgentResult, AgentName, TaskResult
 from task.prompts import TASK_DECOMPOSITION_SYSTEM_PROMPT, AGGREGATION_SYSTEM_PROMPT
 from task.stage_util import StageProcessor
 
@@ -26,57 +26,81 @@ class MASCoordinator:
         self.gpa_gateway = GPAGateway(endpoint=self.endpoint)
         self.ums_gateway = UMSAgentGateway(ums_agent_endpoint=self.ums_agent_endpoint)
 
+        self.gpa_intermediate_state: list = []
+        self.ums_conversation_id: Optional[str] = None
+
     async def handle_request(self, choice: Choice, request: Request) -> Message:
         client: AsyncDial = AsyncDial(
             base_url=self.endpoint,
             api_key=request.api_key,
         )
+        task_results: list[TaskResult] = []
 
-        decomposition_stage = StageProcessor.open_stage(choice, "Task Decomposition")
-        task_decomposition = await self._decompose_task(
-            client=client,
-            request=request,
-        )
-        logger.info(f"Task decomposition: {task_decomposition.model_dump_json()}")
-        decomposition_stage.append_content(
-            f"```json\n{task_decomposition.model_dump_json(indent=2)}\n```\n"
-        )
-        StageProcessor.close_stage_safely(decomposition_stage)
+        task_calls = 0
+        max_task_calls = 10
+        while task_calls < max_task_calls:
+            task_calls += 1  # to avoid infinite loop
 
-        if not task_decomposition.requires_collaboration:
-            result = await self._execute_single_agent(
-                choice=choice,
-                request=request,
-                subtask=task_decomposition.subtasks[0]
-            )
-            return result
-        else:
-            agent_results = await self._execute_multi_agent(
-                choice=choice,
-                request=request,
-                task_decomposition=task_decomposition
-            )
-
-            aggregation_stage = StageProcessor.open_stage(choice, "Aggregating Results")
-            final_response = await self._aggregate_results(
+            task_decomposition = await self._decompose_task(
                 client=client,
                 request=request,
                 choice=choice,
-                agent_results=agent_results,
-                stage=aggregation_stage
+                previous_results=task_results
             )
-            StageProcessor.close_stage_safely(aggregation_stage)
 
-            logger.info(f"Final aggregated response: {final_response.json()}")
-            return final_response
+            if not task_decomposition.subtasks or task_decomposition.stop:
+                logger.warning(f"No subtasks in iteration, stopping")
+                break
+
+            iteration_results = await self._execute_subtasks(
+                choice=choice,
+                request=request,
+                subtasks=task_decomposition.subtasks,
+            )
+
+            task_results.extend(iteration_results)
+
+
+        final_response = await self._aggregate_results(
+            client=client,
+            request=request,
+            choice=choice,
+            task_results=task_results,
+        )
+
+        choice.set_state(
+            {
+                GPA_MESSAGES: self.gpa_intermediate_state,
+                UMS_CONVERSATION_ID: self.ums_conversation_id
+            }
+        )
+
+        logger.info(f"Final aggregated response: {final_response.json()}")
+        return final_response
 
     async def _decompose_task(
             self,
             client: AsyncDial,
-            request: Request
+            choice: Choice,
+            request: Request,
+            previous_results: list[TaskResult]
     ) -> TaskDecomposition:
+        stage = StageProcessor.open_stage(choice, f"Task Decomposition")
+        stage.append_content("## Content:\n")
+
+        msgs = self._prepare_messages(request, TASK_DECOMPOSITION_SYSTEM_PROMPT)
+
+        if previous_results and previous_results:
+            results_context = "## Results from previous tasks:\n\n"
+            for result in previous_results:
+                results_context += f"{result.model_dump_json()}\n"
+
+            msgs[-1]["content"] = f"{results_context}\n---\n\n{msgs[-1]['content']}"
+
+        stage.append_content(f"\n```text\n{request.messages[-1].content}\n```\n")
+
         response = await client.chat.completions.create(
-            messages=self._prepare_messages(request, TASK_DECOMPOSITION_SYSTEM_PROMPT),
+            messages=msgs,
             deployment_name=self.deployment_name,
             extra_body={
                 "response_format": {
@@ -91,80 +115,27 @@ class MASCoordinator:
         )
 
         dict_content = json.loads(response.choices[0].message.content)
-        return TaskDecomposition.model_validate(dict_content)
+        task_decomposition = TaskDecomposition.model_validate(dict_content)
 
-    async def _execute_single_agent(
-            self,
-            choice: Choice,
-            request: Request,
-            subtask: Subtask
-    ) -> Message:
-        stage = StageProcessor.open_stage(choice, f"Executing {subtask.agent_name} Agent")
+        logger.info(f"Task decomposition: {task_decomposition.model_dump_json()}")
 
-        result = await self._call_agent(
-            agent_name=subtask.agent_name,
-            task_description=subtask.task_description,
-            choice=choice,
-            request=request,
-            stage=stage,
-            context=None
-        )
-
+        stage.append_content("## Decomposed task:\n")
+        stage.append_content(f"```json\n{task_decomposition.model_dump_json(indent=2)}\n```\n")
         StageProcessor.close_stage_safely(stage)
-        return result
 
-    async def _execute_multi_agent(
-            self,
-            choice: Choice,
-            request: Request,
-            task_decomposition: TaskDecomposition
-    ) -> List[AgentResult]:
-        results: Dict[int, AgentResult] = {}
-        subtasks_by_id = {st.task_id: st for st in task_decomposition.subtasks}
+        return task_decomposition
 
-        dependency_graph = self._build_dependency_graph(task_decomposition.subtasks)
-
-        if task_decomposition.execution_strategy == "parallel":
-            results = await self._execute_parallel(
-                choice=choice,
-                request=request,
-                subtasks_by_id=subtasks_by_id,
-                dependency_graph=dependency_graph
-            )
-        else:
-            results = await self._execute_sequential(
-                choice=choice,
-                request=request,
-                subtasks_by_id=subtasks_by_id,
-                dependency_graph=dependency_graph
-            )
-
-        return list(results.values())
-
-    def _build_dependency_graph(self, subtasks: List[Subtask]) -> Dict[int, List[int]]:
-        graph = {st.task_id: st.depends_on or [] for st in subtasks}
-        return graph
-
-    async def _execute_sequential(
-            self,
-            choice: Choice,
-            request: Request,
-            subtasks_by_id: Dict[int, Subtask],
-            dependency_graph: Dict[int, List[int]]
-    ) -> Dict[int, AgentResult]:
-        results: Dict[int, AgentResult] = {}
-
-        execution_order = self._topological_sort(dependency_graph)
+    async def _execute_subtasks(self, choice: Choice, request: Request, subtasks: list[Subtask]) -> list[TaskResult]:
+        results: dict[int, TaskResult] = {}
+        subtasks_by_id = {subtask.task_id: subtask for subtask in subtasks}
+        execution_order = self._topological_sort(subtasks)
 
         for task_id in execution_order:
             subtask = subtasks_by_id[task_id]
 
             context = self._gather_context(subtask, results)
 
-            stage = StageProcessor.open_stage(
-                choice,
-                f"Task {task_id}: {subtask.agent_name} Agent"
-            )
+            stage = StageProcessor.open_stage(choice, f"Task {task_id}: {subtask.agent_name}")
 
             try:
                 message = await self._call_agent(
@@ -175,157 +146,70 @@ class MASCoordinator:
                     stage=stage,
                     context=context
                 )
+                if message.custom_content and message.custom_content.state:
+                    state: dict[str, Any] = message.custom_content.state
+                    if state.get(UMS_CONVERSATION_ID):
+                        self.ums_conversation_id = state[UMS_CONVERSATION_ID]
+                    elif state.get(GPA_MESSAGES):
+                        self.gpa_intermediate_state.extend(state[GPA_MESSAGES])
 
-                results[task_id] = AgentResult(
-                    task_id=task_id,
-                    agent_name=subtask.agent_name,
-                    content=message.content,
-                    success=True
-                )
-
-            except Exception as e:
-                logger.error(f"Error executing task {task_id}: {e}")
-                results[task_id] = AgentResult(
-                    task_id=task_id,
-                    agent_name=subtask.agent_name,
-                    content="",
-                    success=False,
-                    error=str(e)
-                )
-            finally:
-                StageProcessor.close_stage_safely(stage)
-
-        return results
-
-    async def _execute_parallel(
-            self,
-            choice: Choice,
-            request: Request,
-            subtasks_by_id: Dict[int, Subtask],
-            dependency_graph: Dict[int, List[int]]
-    ) -> Dict[int, AgentResult]:
-        results: Dict[int, AgentResult] = {}
-
-        levels = self._get_dependency_levels(dependency_graph)
-
-        for level_tasks in levels:
-            tasks = []
-            for task_id in level_tasks:
-                subtask = subtasks_by_id[task_id]
-                context = self._gather_context(subtask, results)
-
-                tasks.append(
-                    self._execute_subtask_with_stage(
-                        task_id=task_id,
-                        subtask=subtask,
-                        choice=choice,
-                        request=request,
-                        context=context
+                results[task_id] = TaskResult(
+                    task=subtask,
+                    agent_result=AgentResult(
+                        task_id=subtask.task_id,
+                        agent_name=subtask.agent_name,
+                        content=message.content,
+                        success=True
                     )
                 )
 
-            level_results = await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception as e:
+                logger.error(f"Error executing task {task_id}: {e}", exc_info=True)
+                results[task_id] = TaskResult(
+                    task=subtask,
+                    agent_result=AgentResult(
+                        task_id=subtask.task_id,
+                        agent_name=subtask.agent_name,
+                        content="",
+                        success=False,
+                        error=str(e)
+                    ))
+            finally:
+                StageProcessor.close_stage_safely(stage)
 
-            for task_result in level_results:
-                if isinstance(task_result, AgentResult):
-                    results[task_result.task_id] = task_result
+        return list(results.values())
 
-        return results
+    def _topological_sort(self, subtasks: list[Subtask]) -> list[int]:
+        children = {subtask.task_id: [] for subtask in subtasks}
+        parent_count = {subtask.task_id: 0 for subtask in subtasks}
 
-    async def _execute_subtask_with_stage(
-            self,
-            task_id: int,
-            subtask: Subtask,
-            choice: Choice,
-            request: Request,
-            context: Optional[str]
-    ) -> AgentResult:
-        stage = StageProcessor.open_stage(
-            choice,
-            f"Task {task_id}: {subtask.agent_name} Agent"
-        )
+        for subtask in subtasks:
+            if subtask.depends_on is not None:
+                children[subtask.depends_on].append(subtask.task_id)
+                parent_count[subtask.task_id] = 1
 
-        try:
-            message = await self._call_agent(
-                agent_name=subtask.agent_name,
-                task_description=subtask.task_description,
-                choice=choice,
-                request=request,
-                stage=stage,
-                context=context
-            )
-
-            return AgentResult(
-                task_id=task_id,
-                agent_name=subtask.agent_name,
-                content=message.content,
-                success=True
-            )
-
-        except Exception as e:
-            logger.error(f"Error executing task {task_id}: {e}")
-            return AgentResult(
-                task_id=task_id,
-                agent_name=subtask.agent_name,
-                content="",
-                success=False,
-                error=str(e)
-            )
-        finally:
-            StageProcessor.close_stage_safely(stage)
-
-    def _topological_sort(self, graph: Dict[int, List[int]]) -> List[int]:
-        in_degree = {node: 0 for node in graph}
-        for node in graph:
-            for neighbor in graph[node]:
-                in_degree[neighbor] = in_degree.get(neighbor, 0) + 1
-
-        queue = [node for node in graph if in_degree[node] == 0]
         result = []
+        queue = [st.task_id for st in subtasks if parent_count[st.task_id] == 0]
 
         while queue:
-            node = queue.pop(0)
-            result.append(node)
+            task_id = queue.pop(0)
+            result.append(task_id)
 
-            for neighbor in graph[node]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
+            for child_id in sorted(children[task_id]):
+                parent_count[child_id] -= 1
+                if parent_count[child_id] == 0:
+                    queue.append(child_id)
 
         return result
 
-    def _get_dependency_levels(self, graph: Dict[int, List[int]]) -> List[List[int]]:
-        in_degree = {node: len(deps) for node, deps in graph.items()}
-        levels = []
-
-        while in_degree:
-            current_level = [node for node, degree in in_degree.items() if degree == 0]
-            if not current_level:
-                break
-
-            levels.append(current_level)
-
-            for node in current_level:
-                del in_degree[node]
-
-            for node in in_degree:
-                in_degree[node] = len([dep for dep in graph[node] if dep not in current_level])
-
-        return levels
-
-    def _gather_context(self, subtask: Subtask, results: Dict[int, AgentResult]) -> Optional[str]:
-        if not subtask.depends_on:
+    def _gather_context(self, subtask: Subtask, results: dict[int, TaskResult]) -> Optional[str]:
+        if subtask.depends_on is None:
             return None
 
-        context_parts = []
-        for dep_id in subtask.depends_on:
-            if dep_id in results and results[dep_id].success:
-                context_parts.append(
-                    f"## Result from Task {dep_id} ({results[dep_id].agent_name}):\n"
-                    f"{results[dep_id].content}\n"
-                )
+        if subtask.depends_on in results and results[subtask.depends_on].agent_result.success:
+            return results[subtask.depends_on].model_dump_json()
 
-        return "\n".join(context_parts) if context_parts else None
+        return None
 
     async def _call_agent(
             self,
@@ -346,13 +230,14 @@ class MASCoordinator:
                 request=request,
                 stage=stage,
                 task_description=instruction,
+                gpa_intermediate_state=self.gpa_intermediate_state,
             )
         elif agent_name == AgentName.UMS:
             return await self.ums_gateway.response(
-                choice=choice,
                 request=request,
                 stage=stage,
                 task_description=instruction,
+                ums_conversation_id=self.ums_conversation_id,
             )
         else:
             raise ValueError(f"Unknown agent: {agent_name}")
@@ -362,17 +247,13 @@ class MASCoordinator:
             client: AsyncDial,
             choice: Choice,
             request: Request,
-            agent_results: List[AgentResult],
-            stage: Stage
+            task_results: list[TaskResult],
     ) -> Message:
-        results_context = "# Agent Results:\n\n"
-        for result in agent_results:
-            if result.success:
-                results_context += f"## Task {result.task_id} - {result.agent_name} Agent:\n"
-                results_context += f"{result.content}\n\n"
-            else:
-                results_context += f"## Task {result.task_id} - {result.agent_name} Agent FAILED:\n"
-                results_context += f"Error: {result.error}\n\n"
+        stage = StageProcessor.open_stage(choice, "Aggregating Results")
+
+        results_context = "# Tasks Results:\n\n"
+        for result in task_results:
+            results_context += f"{result.model_dump_json()}\n"
 
         msgs = self._prepare_messages(request, AGGREGATION_SYSTEM_PROMPT)
         original_user_request = msgs[-1]["content"]
@@ -383,6 +264,10 @@ class MASCoordinator:
             f"# Original User Request:\n{original_user_request}\n\n"
             f"Please synthesize the agent results into a coherent response for the user."
         )
+
+        stage.append_content("## Request: ")
+        stage.append_content(f"\n```text\n{msgs[-1]["content"]}\n```\n")
+        stage.append_content("## Response: \n")
 
         chunks = await client.chat.completions.create(
             stream=True,
@@ -399,16 +284,13 @@ class MASCoordinator:
                     choice.append_content(delta.content)
                     content += delta.content
 
+        StageProcessor.close_stage_safely(stage)
         return Message(
             role=Role.ASSISTANT,
             content=StrictStr(content),
         )
 
-    def _prepare_messages(
-            self,
-            request: Request,
-            system_prompt: str
-    ) -> list[dict[str, Any]]:
+    def _prepare_messages(self, request: Request, system_prompt: str) -> list[dict[str, Any]]:
         msgs = [
             {
                 "role": Role.SYSTEM,

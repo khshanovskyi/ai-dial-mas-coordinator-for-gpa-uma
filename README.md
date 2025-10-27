@@ -1,2 +1,3 @@
-# ai-dial-mas-coordinator-for-gpa-uma
-MAS (Multi Agent System) Coordindator to Work with General-purspose and Users Management Agents
+MAS (Multi Agent System) Coordinator to Work with General-purpose and Users Management Agents
+
+<img src="flow.png">
