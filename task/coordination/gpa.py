@@ -107,12 +107,13 @@ class GPAGateway:
                         res_messages.append(copied_msg.dict(exclude_none=True))
 
         last_user_msg = request.messages[-1]
+        custom_content = last_user_msg.custom_content
         if additional_instructions:
             res_messages.append(
                 {
                     "role": Role.USER,
                     "content": f"{last_user_msg.content}\n\n{additional_instructions}",
-                    "custom_content": last_user_msg.custom_content.dict(exclude_none=True),
+                    "custom_content": custom_content.dict(exclude_none=True) if custom_content else None,
                 }
             )
         else:
